@@ -1,0 +1,15 @@
+#!/bin/sh
+# Teeny Core init (busybox init calls this once).
+mount -t proc proc /proc 2>/dev/null
+mount -t sysfs sysfs /sys 2>/dev/null
+mount -t devtmpfs devtmpfs /dev 2>/dev/null || mount -t tmpfs tmpfs /dev
+
+mkdir -p /dev/pts /var/run /var/lock /var/log /var/tmp
+mount -t devpts devpts /dev/pts 2>/dev/null
+
+hostname teenycore 2>/dev/null || true
+
+version=$(cat /etc/teenycore/version 2>/dev/null || echo "?")
+echo "Teeny Core Linux $version — the 'download everything' edition"
+echo "  get online:  wifi"
+echo "  get stuff:   pkg update && pkg search <term> && pkg install <pkg>"
