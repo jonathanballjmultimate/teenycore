@@ -1,0 +1,135 @@
+#!/bin/sh
+# wifi — get Teeny Core onto wireless networks.
+# Drives wpa_supplicant via wpa_cli: no D-Bus, one daemon, one client.
+# Requirements: kernel with cfg80211 + mac80211 and a driver for your NIC
+# (compiled in), wpa_supplicant + wpa_cli in /usr/sbin, udhcpc for DHCP.
+set -u
+
+SUP=wpa_supplicant
+CLI=wpa_cli
+CONF=/etc/wpa_supplicant.conf
+CTRL=/var/run/wpa_supplicant
+dev=${WIFI_DEV:-}
+
+say() { printf '%s\n' "$*"; }
+die() { say "wifi: $*" >&2; exit 1; }
+
+pick_dev() {
+  [ -n "$dev" ] && return 0
+  for d in $(ls /sys/class/net 2>/dev/null); do
+    case "$d" in wlan*|wlp*) dev=$d; return 0 ;; esac
+  done
+  die "no wireless interface found (pass one: wifi -d wlan0 …)"
+}
+
+ensure_up() {
+  pick_dev
+  mkdir -p "$CTRL" /var/run
+  if ! pidof "$SUP" >/dev/null 2>&1; then
+    say "starting wpa_supplicant on $dev …"
+    [ -f "$CONF" ] || touch "$CONF"
+    "$SUP" -B -i "$dev" -c "$CONF" -C "$CTRL" \
+      || die "could not start wpa_supplicant (driver compiled into your kernel?)"
+    sleep 1
+  fi
+}
+
+scan_networks() {
+  ensure_up
+  "$CLI" -i "$dev" scan >/dev/null 2>&1
+  sleep 2
+  "$CLI" -i "$dev" scan_results 2>/dev/null | awk 'NR>1 && NF>=5 {
+    ssid=""; for (i=5;i<=NF;i++) ssid = ssid (i==5 ? "" : " ") $i
+    printf "  %-28s %s dBm\n", ssid, $3
+  }' | sort | uniq
+  say "SSID                             signal"
+}
+
+connect_net() { # <ssid> [passphrase]
+  ssid=$1; pass=${2:-}
+  ensure_up
+  "$CLI" -i "$dev" remove_network 0 >/dev/null 2>&1 || true
+  id=$("$CLI" -i "$dev" add_network 2>/dev/null | tail -n1)
+  [ -n "$id" ] || die "wpa_cli add_network failed"
+  "$CLI" -i "$dev" set_network "$id" ssid "\"$ssid\"" >/dev/null || die "could not set SSID"
+  if [ -n "$pass" ]; then
+    "$CLI" -i "$dev" set_network "$id" psk "\"$pass\"" >/dev/null || die "could not set passphrase"
+  else
+    "$CLI" -i "$dev" set_network "$id" key_mgmt NONE >/dev/null
+  fi
+  "$CLI" -i "$dev" enable_network "$id" >/dev/null
+  "$CLI" -i "$dev" select_network "$id" >/dev/null 2>&1
+  say "associating with $ssid …"
+  sleep 3
+  if "$CLI" -i "$dev" status 2>/dev/null | grep -q 'wpa_state=COMPLETED'; then
+    say "connected to $ssid"
+    if command -v udhcpc >/dev/null 2>&1; then
+      say "requesting an address via udhcpc …"
+      udhcpc -i "$dev" -q -n || say "dhcp failed — set an address manually (ip addr add …)"
+    fi
+    "$CLI" -i "$dev" save_config >/dev/null 2>&1 || true
+  else
+    say "association not completed yet — try again after a moment: wifi status"
+  fi
+}
+
+disconnect_net() {
+  pick_dev
+  "$CLI" -i "$dev" disconnect >/dev/null 2>&1
+  "$CLI" -i "$dev" remove_network 0 >/dev/null 2>&1 || true
+  say "disconnected $dev"
+}
+
+status_net() {
+  pick_dev
+  "$CLI" -i "$dev" status 2>/dev/null | grep -E 'ssid|wpa_state|ip_address' \
+    | sed 's/^/  /' || say "(no active connection)"
+}
+
+wifi_default() {
+  say "scanning …"
+  scan_networks
+  say ""
+  printf 'connect to which SSID (Enter to skip)? '
+  read -r ans
+  [ -n "$ans" ] || return 0
+  printf 'passphrase (blank = open network)? '
+  read -r p
+  connect_net "$ans" "$p"
+}
+
+usage() {
+  cat <<'EOF'
+Teeny Core wifi — wireless for the download-everything edition
+
+usage: wifi [-d DEVICE] <command>
+
+  wifi                 scan, then prompt to connect
+  wifi list            scan + list networks
+  wifi connect SSID [passphrase]
+  wifi disconnect
+  wifi status
+
+examples:
+  wifi -d wlan0 list
+  wifi connect MyCoffee ********
+  wifi connect OpenAP          (open network, no passphrase)
+EOF
+}
+
+if [ $# -ge 2 ] && [ "$1" = "-d" ]; then
+  dev=$2; shift 2
+fi
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  ""|scan)          wifi_default ;;
+  list)             scan_networks ;;
+  connect)          [ $# -ge 1 ] || die "usage: wifi connect SSID [passphrase]"
+                    connect_net "$1" "${2:-}" ;;
+  disconnect)       disconnect_net ;;
+  status)           status_net ;;
+  help|-h|--help)   usage ;;
+  *) say "wifi: unknown command: $cmd (try wifi help)"; exit 2 ;;
+esac
