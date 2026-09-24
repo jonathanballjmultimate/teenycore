@@ -1,0 +1,255 @@
+#!/bin/sh
+# pkg — Teeny Core Linux package manager ("download everything" edition)
+# POSIX sh, busybox-ash compatible. No bashisms.
+set -u
+
+# ---------------------------------------------------------------- config --
+# Local env wins over the baked-in /etc config, so staged installs and
+# alternate repos Just Work on a dev box.
+if [ -z "${TEENYCORE_REPO:-}" ] && [ -f /etc/teenycore/repo.conf ]; then
+  . /etc/teenycore/repo.conf
+fi
+REPO_URL=${TEENYCORE_REPO:-${REPO_URL:-}}
+REPO_KEY=${REPO_KEY:-/etc/teenycore/repo.pub}
+
+# locate signify: override with $SIGNIFY, else PATH, else the baked-in path
+SIGNIFY=${SIGNIFY:-}
+if [ -z "$SIGNIFY" ]; then
+  if command -v signify >/dev/null 2>&1; then
+    SIGNIFY=$(command -v signify)
+  else
+    SIGNIFY=/usr/bin/signify
+  fi
+fi
+
+ROOT=${TEENYCORE_ROOT:-/}
+CACHE=${TEENYCORE_CACHE:-/var/cache/teenycore}
+LIB=${TEENYCORE_LIB:-/var/lib/teenycore}
+INDEX="$LIB/index.txt"
+
+say() { printf '%s\n' "$*"; }
+die() { say "pkg: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------- helpers --
+fetch() { # <url> <destfile>
+  if command -v wget >/dev/null 2>&1; then wget -q -O "$2" "$1"; return $?; fi
+  if command -v curl >/dev/null 2>&1; then curl -fsSL -o "$2" "$1"; return $?; fi
+  die "no wget or curl available"
+}
+
+need_index() {
+  [ -f "$INDEX" ] || die "no verified index — run: pkg update"
+}
+
+line_of() { # <pkgname> -> matching index line (or nothing)
+  awk -F '\t' -v n="$1" '$1 == n { print; exit }' "$INDEX" 2>/dev/null
+}
+
+field() { # <line> <n>   (cut defaults to TAB delimiter)
+  printf '%s\n' "$1" | cut -f "$2"
+}
+
+tar_list() { # <tarball> -> clean file list (no ./ prefix, no empty, no meta/)
+  tar -tzf "$1" | sed 's#^\./##' | grep -v '^$' | grep -v '^meta/'
+}
+
+# ------------------------------------------------------------ commands ----
+cmd_update() {
+  [ -n "$REPO_URL" ] || die "no repo configured (set TEENYCORE_REPO or fix /etc/teenycore/repo.conf)"
+  mkdir -p "$LIB" "$CACHE"
+  tmp="$CACHE/index.txt.new"
+  fetch "$REPO_URL/index.txt" "$tmp"       || die "could not fetch $REPO_URL/index.txt"
+  fetch "$REPO_URL/index.txt.sig" "$tmp.sig" || die "could not fetch index signature"
+  [ -f "$REPO_KEY" ] || die "missing verification key: $REPO_KEY"
+  "$SIGNIFY" -V -p "$REPO_KEY" -m "$tmp" -x "$tmp.sig" \
+    || die "index signature verification FAILED — refusing to trust this repo"
+  mv "$tmp" "$INDEX"
+  rm -f "$tmp.sig"
+  say "index updated: $(wc -l < "$INDEX") package(s) available"
+}
+
+cmd_search() { # TERM
+  need_index
+  [ $# -ge 1 ] || die "usage: pkg search TERM"
+  t=$(printf '%s' "$1" | tr 'A-Z' 'a-z')
+  awk -F '\t' -v t="$t" '
+    function hum(n) {
+      if (n >= 1048576) return sprintf("%.1fM", n/1048576)
+      if (n >= 1024)    return sprintf("%.1fK", n/1024)
+      return n "B"
+    }
+    tolower($1) ~ t {
+      printf "%-20s %-10s %7s  deps: %s\n", $1, $2, hum($3), ($6=="-"?"none":$6)
+    }' "$INDEX"
+}
+
+cmd_info() { # NAME
+  need_index
+  [ $# -ge 1 ] || die "usage: pkg info NAME"
+  l=$(line_of "$1")
+  [ -n "$l" ] || die "no such package: $1"
+  s=$(field "$l" 3)
+  say "name:    $(field "$l" 1)"
+  say "version: $(field "$l" 2)"
+  say "size:    $(awk -v n="$s" 'BEGIN{ if (n>=1048576) {printf "%.1fM", n/1048576; exit}
+                                  if (n>=1024)    {printf "%.1fK", n/1024;    exit}
+                                  print n "B" }' 2>/dev/null)"
+  say "sha256:  $(field "$l" 4 | cut -c1-16)…"
+  say "url:     $REPO_URL/$(field "$l" 5)"
+  say "deps:    $(field "$l" 6)"
+}
+
+cmd_describe() { # NAME  (downloads the package, prints meta/description.txt)
+  need_index
+  [ $# -ge 1 ] || die "usage: pkg describe NAME"
+  l=$(line_of "$1")
+  [ -n "$l" ] || die "no such package: $1"
+  path=$(field "$l" 5)
+  fname=${path##*/}
+  cachefile="$CACHE/$fname"
+  mkdir -p "$CACHE"
+  [ -f "$cachefile" ] || fetch "$REPO_URL/$path" "$cachefile" || die "download failed: $path"
+  got=$(sha256sum "$cachefile" | awk '{print $1}')
+  [ "$got" = "$(field "$l" 4)" ] || die "checksum mismatch for $1 — package tampered or truncated"
+  d=$(mktemp -d)
+  tar -xzf "$cachefile" -C "$d"
+  if [ -f "$d/meta/description.txt" ]; then cat "$d/meta/description.txt"; fi
+  rm -rf "$d"
+}
+
+cmd_install() { # NAME ...
+  [ $# -ge 1 ] || die "usage: pkg install NAME […]"
+  need_index
+  [ -n "$REPO_URL" ] || die "no repo configured (set TEENYCORE_REPO or fix /etc/teenycore/repo.conf)"
+  [ "$ROOT" != / ] || [ "$(id -u)" = 0 ] \
+    || die "must be root to install (or set TEENYCORE_ROOT for a staged install)"
+  mkdir -p "$CACHE" "$LIB/installed"
+
+  seen=""
+  order=""
+  resolve() { # <pkgname> — depth-first, deps first, cycle-safe
+    case " $seen " in *" $1 "*) return;; esac
+    seen="$seen $1"
+    l=$(line_of "$1")
+    [ -n "$l" ] || die "no such package: $1 (needed by one of your selections)"
+    d=$(field "$l" 6)
+    if [ "$d" != "-" ]; then
+      oldIFS=$IFS; IFS=,
+      for dep in $d; do
+        IFS=$oldIFS
+        [ -n "$dep" ] && resolve "$dep"
+      done
+      IFS=$oldIFS
+    fi
+    order="$order $1"
+  }
+
+  for p in "$@"; do resolve "$p"; done
+  for p in $order; do install_one "$p"; done
+}
+
+install_one() { # <pkgname>
+  l=$(line_of "$1")
+  ver=$(field "$l" 2); sha=$(field "$l" 4); path=$(field "$l" 5)
+  fname=${path##*/}
+  cachefile="$CACHE/$fname"
+
+  [ -f "$cachefile" ] || fetch "$REPO_URL/$path" "$cachefile" || die "download failed: $path"
+  got=$(sha256sum "$cachefile" | awk '{print $1}')
+  [ "$got" = "$sha" ] || die "checksum mismatch for $1 — package tampered or truncated"
+
+  say "installing $1 $ver"
+  st=$(mktemp -d)
+  tar -xzf "$cachefile" -C "$st" || { rm -rf "$st"; die "bad archive: $fname"; }
+  mkdir -p "$ROOT"
+
+  # payload = everything except meta/
+  ( cd "$st" \
+      && find . -mindepth 1 -maxdepth 1 ! -name meta -exec cp -a {} "$ROOT/" \;
+  )
+
+  tar_list "$cachefile" > "$LIB/installed/$1.files"
+
+  if [ -f "$st/meta/install.sh" ]; then
+    if ( cd "$ROOT" && TEENYCORE_ROOT="$ROOT" sh "$st/meta/install.sh" ) >/dev/null 2>&1; then
+      say "  post-install: ok"
+    else
+      rm -rf "$st"
+      die "post-install hook failed for $1 (partial install — rerun pkg install $1)"
+    fi
+  fi
+
+  rm -rf "$st"
+  say "installed $1 $ver"
+}
+
+cmd_remove() { # NAME
+  [ $# -ge 1 ] || die "usage: pkg remove NAME"
+  f="$LIB/installed/$1.files"
+  [ -f "$f" ] || die "not installed: $1"
+
+  others=""
+  for of in "$LIB"/installed/*.files; do
+    [ -f "$of" ] || continue
+    [ "${of##*/}" = "$1.files" ] && continue
+    others="$others $(cat "$of")"
+  done
+
+  # delete files we own that no other installed package also claims,
+  # deepest-first, files and symlinks only
+  cat "$f" | while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    full="$ROOT/$rel"
+    case " $others " in
+      *" $rel "*) : ;;                                  # shared — keep
+      *) [ -f "$full" ] || [ -L "$full" ] && rm -f "$full" ;;
+    esac
+  done
+
+  # prune empty dirs we orphaned (never touches $ROOT itself)
+  if [ -n "$ROOT" ] && [ "$ROOT" != "/" ]; then
+    find "$ROOT" -depth -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  fi
+
+  rm -f "$f"
+  say "removed $1"
+}
+
+cmd_list() {
+  if [ ! -d "$LIB/installed" ]; then say "(nothing installed yet)"; return 0; fi
+  for f in "$LIB"/installed/*.files; do
+    [ -e "$f" ] || continue
+    basename "$f" .files
+  done | sort
+}
+
+usage() {
+  cat <<'EOF'
+Teeny Core pkg — the download-everything package manager
+
+usage: pkg <command> [args]
+
+  pkg update            fetch + verify the signed package index
+  pkg search TERM       find packages by name
+  pkg info NAME         show metadata for a package
+  pkg describe NAME     show the package's description (downloads it)
+  pkg install NAME …    resolve deps, download, verify, install
+  pkg remove NAME       uninstall (files shared with others are kept)
+  pkg list              show installed packages
+
+environment:
+  TEENYCORE_REPO   repo base URL            (default: /etc/teenycore/repo.conf)
+  TEENYCORE_ROOT   install prefix           (default /; set for staged installs)
+  TEENYCORE_CACHE  download cache           (default /var/cache/teenycore)
+  TEENYCORE_LIB    state dir                (default /var/lib/teenycore)
+  SIGNIFY          path to signify verifier (else auto-detected)
+EOF
+}
+
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+  update|search|info|describe|install|remove|list) cmd_$cmd "$@" ;;
+  help|-h|--help|"") usage ;;
+  *) say "pkg: unknown command: $cmd"; usage; exit 2 ;;
+esac
