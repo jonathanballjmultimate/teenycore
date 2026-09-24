@@ -1,0 +1,1 @@
+Teeny Core smoke-test package — says hi.
