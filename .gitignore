@@ -1,0 +1,9 @@
+# Build artifacts
+out/
+downloads/
+
+# Secrets — NEVER commit the private key
+keys/
+
+# The publish tree is a *different* repo (teenycore-repo)
+repo/
